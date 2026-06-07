@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Neon Dash — built with the Hermes game-development skill</title>
+<style>
+  :root { --bg:#0b0d17; --fg:#e7ecff; --accent:#39f3ff; --accent2:#ff3df0; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; background:var(--bg); color:var(--fg);
+    font-family:"Segoe UI",system-ui,sans-serif; overflow:hidden; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { background:radial-gradient(circle at 50% 35%, #141a33 0%, #0b0d17 70%);
+    border:1px solid #1d2547; touch-action:none; }
+  #hint { position:fixed; bottom:10px; width:100%; text-align:center;
+    font-size:12px; color:#5b6488; letter-spacing:.5px; }
+  #hint a { color:var(--accent); text-decoration:none; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="480" height="720"></canvas></div>
+<div id="hint">Move: mouse / touch / A‑D / ←→ &nbsp;·&nbsp; built with the Hermes <b>game-development</b> skill</div>
+<script>
+/* ============================================================================
+ * Neon Dash — a tiny, complete, juicy arcade game.
+ *
+ * Built as a live demo of the Hermes `game-development` skill. It deliberately
+ * follows the patterns the skill teaches:
+ *   - fixed-timestep simulation + variable-timestep render (core-systems.md)
+ *   - an explicit game-state machine: MENU -> PLAY -> DEAD (core-systems.md)
+ *   - object pooling for particles (core-systems.md / optimization)
+ *   - "juice": screen shake, hit-stop, particle bursts, eased scaling (polish)
+ * Single file, no dependencies, runs in any browser.
+ * ==========================================================================*/
+
+const cvs = document.getElementById("c");
+const ctx = cvs.getContext("2d");
+const W = cvs.width, H = cvs.height;
+
+// ---- Game state machine -----------------------------------------------------
+const STATE = { MENU: "menu", PLAY: "play", DEAD: "dead" };
+let state = STATE.MENU;
+
+// ---- Player -----------------------------------------------------------------
+const player = { x: W / 2, y: H - 90, r: 13, vx: 0, targetX: W / 2 };
+
+// ---- World ------------------------------------------------------------------
+let obstacles = [];     // falling hazards
+let orbs = [];          // collectibles
+let particles = [];     // pooled
+let score = 0, best = Number(localStorage.getItem("neondash_best") || 0);
+let spawnTimer = 0, orbTimer = 0, speed = 240, elapsed = 0;
+let shake = 0, hitStop = 0, flash = 0;
+
+// ---- Input (action-style, device-agnostic) ----------------------------------
+let pointerX = null, keyLeft = false, keyRight = false;
+function setPointer(e){
+  const rect = cvs.getBoundingClientRect();
+  const cx = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+  pointerX = cx * (W / rect.width);
+}
+cvs.addEventListener("mousemove", setPointer);
+cvs.addEventListener("touchstart", e => { setPointer(e); onAction(); e.preventDefault(); }, {passive:false});
+cvs.addEventListener("touchmove",  e => { setPointer(e); e.preventDefault(); }, {passive:false});
+cvs.addEventListener("mousedown", onAction);
+addEventListener("keydown", e => {
+  if (e.code==="ArrowLeft"||e.code==="KeyA") keyLeft=true;
+  if (e.code==="ArrowRight"||e.code==="KeyD") keyRight=true;
+  if (e.code==="Space"||e.code==="Enter") onAction();
+});
+addEventListener("keyup", e => {
+  if (e.code==="ArrowLeft"||e.code==="KeyA") keyLeft=false;
+  if (e.code==="ArrowRight"||e.code==="KeyD") keyRight=false;
+});
+function onAction(){ if (state!==STATE.PLAY) startGame(); }
+
+// ---- Particle pool ----------------------------------------------------------
+function burst(x, y, color, n){
+  for (let i=0;i<n;i++){
+    const a = Math.random()*Math.PI*2, sp = 40 + Math.random()*220;
+    let p = particles.find(p=>!p.alive);
+    if (!p){ p={}; particles.push(p); }
+    p.alive=true; p.x=x; p.y=y; p.vx=Math.cos(a)*sp; p.vy=Math.sin(a)*sp;
+    p.life=p.max=0.4+Math.random()*0.5; p.color=color; p.size=2+Math.random()*3;
+  }
+}
+
+// ---- Lifecycle --------------------------------------------------------------
+function startGame(){
+  state = STATE.PLAY;
+  obstacles = []; orbs = []; score = 0; speed = 240; elapsed = 0;
+  spawnTimer = 0; orbTimer = 0.6;
+  player.x = player.targetX = W/2; player.vx = 0;
+}
+function die(){
+  state = STATE.DEAD;
+  shake = 16; hitStop = 0.12; flash = 1;
+  burst(player.x, player.y, "#ff3df0", 60);
+  best = Math.max(best, Math.floor(score));
+  localStorage.setItem("neondash_best", best);
+}
+
+// ---- Fixed-timestep update --------------------------------------------------
+const STEP = 1/120;
+function update(dt){
+  // particles always simulate (menu/dead included) for ambient life
+  for (const p of particles){
+    if (!p.alive) continue;
+    p.life -= dt; if (p.life<=0){ p.alive=false; continue; }
+    p.x += p.vx*dt; p.y += p.vy*dt; p.vy += 300*dt; p.vx *= 0.98;
+  }
+  shake = Math.max(0, shake - 40*dt);
+  flash = Math.max(0, flash - 3*dt);
+
+  if (state!==STATE.PLAY) return;
+  if (hitStop>0){ hitStop-=dt; return; }
+
+  elapsed += dt;
+  speed = 240 + elapsed*9;            // ramps difficulty over time
+
+  // player movement: pointer steering OR key accel, with easing (game feel)
+  if (pointerX!==null && !keyLeft && !keyRight) player.targetX = pointerX;
+  else { if(keyLeft) player.targetX-=420*dt; if(keyRight) player.targetX+=420*dt; }
+  player.targetX = Math.max(player.r, Math.min(W-player.r, player.targetX));
+  player.x += (player.targetX - player.x) * Math.min(1, 14*dt);  // eased follow
+
+  // spawn hazards
+  spawnTimer -= dt;
+  if (spawnTimer<=0){
+    spawnTimer = Math.max(0.28, 0.95 - elapsed*0.012);
+    const w = 38 + Math.random()*70;
+    obstacles.push({ x: Math.random()*(W-w), y:-40, w, h:22 });
+  }
+  // spawn orbs
+  orbTimer -= dt;
+  if (orbTimer<=0){ orbTimer = 1.1 + Math.random()*0.8;
+    orbs.push({ x: 24+Math.random()*(W-48), y:-20, r:9, t:0 }); }
+
+  // move + collide hazards
+  for (const o of obstacles){ o.y += speed*dt;
+    if (player.x > o.x-player.r && player.x < o.x+o.w+player.r &&
+        player.y > o.y-player.r && player.y < o.y+o.h+player.r){ die(); return; }
+  }
+  obstacles = obstacles.filter(o=>{ if(o.y>H+40){ score+=1; return false;} return true; });
+
+  // move + collect orbs
+  for (const orb of orbs){ orb.y += speed*0.85*dt; orb.t += dt;
+    const dx=player.x-orb.x, dy=player.y-orb.y;
+    if (dx*dx+dy*dy < (player.r+orb.r)*(player.r+orb.r)){
+      orb.dead=true; score+=10; shake=Math.max(shake,4);
+      burst(orb.x, orb.y, "#39f3ff", 14);
+    }
+  }
+  orbs = orbs.filter(o=>!o.dead && o.y<H+30);
+}
+
+// ---- Render (variable timestep) ---------------------------------------------
+function draw(){
+  ctx.save();
+  if (shake>0) ctx.translate((Math.random()-.5)*shake, (Math.random()-.5)*shake);
+  ctx.clearRect(-30,-30,W+60,H+60);
+
+  // ambient grid
+  ctx.globalAlpha=0.12; ctx.strokeStyle="#2a3566"; ctx.lineWidth=1;
+  for(let gy=(elapsed*speed*0.2)%40; gy<H; gy+=40){ ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(W,gy); ctx.stroke(); }
+  ctx.globalAlpha=1;
+
+  // orbs
+  for (const orb of orbs){
+    const pulse = 1+Math.sin(orb.t*8)*0.15;
+    ctx.beginPath(); ctx.arc(orb.x,orb.y,orb.r*pulse,0,7);
+    ctx.fillStyle="#39f3ff"; ctx.shadowColor="#39f3ff"; ctx.shadowBlur=18; ctx.fill();
+  }
+  ctx.shadowBlur=0;
+
+  // hazards
+  for (const o of obstacles){
+    ctx.fillStyle="#ff3df0"; ctx.shadowColor="#ff3df0"; ctx.shadowBlur=14;
+    ctx.fillRect(o.x,o.y,o.w,o.h);
+  }
+  ctx.shadowBlur=0;
+
+  // particles
+  for (const p of particles){ if(!p.alive) continue;
+    ctx.globalAlpha = Math.max(0, p.life/p.max); ctx.fillStyle=p.color;
+    ctx.fillRect(p.x-p.size/2, p.y-p.size/2, p.size, p.size);
+  }
+  ctx.globalAlpha=1;
+
+  // player (hidden while dead)
+  if (state!==STATE.DEAD){
+    ctx.beginPath(); ctx.arc(player.x,player.y,player.r,0,7);
+    ctx.fillStyle="#e7ecff"; ctx.shadowColor="#39f3ff"; ctx.shadowBlur=20; ctx.fill();
+    ctx.shadowBlur=0;
+  }
+
+  // HUD
+  ctx.fillStyle="#e7ecff"; ctx.font="bold 22px Segoe UI,sans-serif"; ctx.textAlign="left";
+  ctx.fillText(Math.floor(score), 16, 32);
+  ctx.fillStyle="#5b6488"; ctx.font="12px Segoe UI,sans-serif"; ctx.textAlign="right";
+  ctx.fillText("BEST "+best, W-16, 28);
+
+  // flash on death
+  if (flash>0){ ctx.fillStyle="rgba(255,61,240,"+(flash*0.4)+")"; ctx.fillRect(0,0,W,H); }
+
+  // overlays
+  ctx.textAlign="center";
+  if (state===STATE.MENU){
+    title("NEON DASH", "#39f3ff");
+    ctx.fillStyle="#aeb9e8"; ctx.font="16px Segoe UI";
+    ctx.fillText("Dodge the pink. Grab the cyan.", W/2, H/2+10);
+    blink("click / tap / space to start", H/2+50);
+  } else if (state===STATE.DEAD){
+    title("GAME OVER", "#ff3df0");
+    ctx.fillStyle="#e7ecff"; ctx.font="bold 26px Segoe UI";
+    ctx.fillText("Score "+Math.floor(score), W/2, H/2+12);
+    blink("click / tap / space to retry", H/2+54);
+  }
+  ctx.restore();
+}
+function title(t,col){ ctx.fillStyle=col; ctx.shadowColor=col; ctx.shadowBlur=24;
+  ctx.font="bold 46px Segoe UI"; ctx.fillText(t, W/2, H/2-40); ctx.shadowBlur=0; }
+function blink(t,y){ if(Math.sin(performance.now()/300)>-0.3){
+  ctx.fillStyle="#5b6488"; ctx.font="14px Segoe UI"; ctx.fillText(t, W/2, y); } }
+
+// ---- Main loop: fixed update + variable render (skill's core-systems) -------
+let last=performance.now(), acc=0;
+function frame(now){
+  let dt=(now-last)/1000; last=now; if(dt>0.25) dt=0.25; acc+=dt;
+  while(acc>=STEP){ update(STEP); acc-=STEP; }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
